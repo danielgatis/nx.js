@@ -20,10 +20,15 @@ typedef struct {
 // The libnx swkbd callbacks are global C functions, so the active keyboard is
 // tracked in a file-global pointer (only one inline keyboard at a time).
 static nx_swkbd_t *current_kbd;
+// The live keyboard, closed at runtime teardown: `free_kbd` only runs from
+// the V8 finalizer, which never fires on the exit path.
+static nx_swkbd_t *g_live_kbd;
 
 nx_swkbd_t *get_kbd(Local<Value> v) { return nx::Unwrap<nx_swkbd_t>(v); }
 
 void free_kbd(nx_swkbd_t *data) {
+	if (g_live_kbd == data)
+		g_live_kbd = NULL;
 	swkbdInlineClose(&data->kbdinline);
 	data->instance.Reset();
 	data->cancel_func.Reset();
@@ -123,6 +128,7 @@ void nx_swkbd_create(const FunctionCallbackInfo<Value> &info) {
 		nx_throw_libnx_error(iso, rc, "swkbdInlineLaunchForLibraryApplet");
 		return;
 	}
+	g_live_kbd = data;
 	swkbdInlineSetChangedStringCallback(&data->kbdinline, strchange_cb);
 	swkbdInlineSetMovedCursorCallback(&data->kbdinline, movedcursor_cb);
 	swkbdInlineSetDecidedEnterCallback(&data->kbdinline, decidedenter_cb);
@@ -179,6 +185,15 @@ void nx_swkbd_show(const FunctionCallbackInfo<Value> &info) {
 	data->appearArg.returnButtonFlag = opt_bool(iso, o, "enableReturn");
 	data->appearArg.stringLenMin = opt_int(iso, o, "minLength", 0);
 	data->appearArg.stringLenMax = opt_int(iso, o, "maxLength", 0);
+	// The applet keeps its cursor position across Appear; past the end of
+	// the new text every keystroke is dropped.
+	{
+		Local<Value> v;
+		int32_t cursor = 0;
+		if (o->Get(ctx, nx_str(iso, "value")).ToLocal(&v) && v->IsString())
+			cursor = v.As<String>()->Length();
+		swkbdInlineSetCursorPos(&data->kbdinline, cursor);
+	}
 	swkbdInlineAppear(&data->kbdinline, &data->appearArg);
 
 	int x = 0, y = 0, width = 0, height = 0;
@@ -231,11 +246,25 @@ void nx_swkbd_set_input_text(const FunctionCallbackInfo<Value> &info) {
 	if (!data)
 		return;
 	String::Utf8Value value(iso, info[1]);
-	if (*value)
-		swkbdInlineSetInputText(&data->kbdinline, *value);
+	// An empty string clears the applet's text.
+	swkbdInlineSetInputText(&data->kbdinline, *value ? *value : "");
 }
 
 } // namespace
+
+// Called from main() teardown, before service exits. Dismisses a visible
+// keyboard, flushes the request, and closes the inline applet session.
+void nx_swkbd_teardown() {
+	nx_swkbd_t *data = g_live_kbd;
+	if (!data)
+		return;
+	g_live_kbd = NULL;
+	current_kbd = NULL;
+	swkbdInlineDisappear(&data->kbdinline);
+	swkbdInlineUpdate(&data->kbdinline, NULL);
+	swkbdInlineClose(&data->kbdinline);
+	fprintf(stderr, "[swkbd] inline applet closed at teardown\n");
+}
 
 void nx_init_swkbd(Isolate *iso, Local<Object> init_obj) {
 	current_kbd = NULL;
